@@ -163,6 +163,9 @@ function v2Advertisement(): Buffer {
   return Buffer.concat(lines);
 }
 
+/** The v2 advertisement carries no repo state at all, so build it once. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 export async function gitInfoRefs(ctx: HandlerContext, owner: string, repoName: string): Promise<void> {
   const service = ctx.url.searchParams.get('service');
   const repo = store.getRepo(owner, repoName);
@@ -176,13 +179,62 @@ export async function gitInfoRefs(ctx: HandlerContext, owner: string, repoName: 
   }
   const wantsV2 =
     service === 'git-upload-pack' && (ctx.req.headers['git-protocol'] ?? '').includes('version=2');
-  const body = wantsV2 ? v2Advertisement() : v0Advertisement(repo, service);
+  const body = wantsV2 ? V2_ADVERTISEMENT : v0Advertisement(repo, service);
   ctx.res.writeHead(200, {
     'content-type': `application/x-${service}-advertisement`,
     'content-length': body.length,
     'cache-control': 'no-cache',
   });
   ctx.res.end(body);
+}
+
+// -------------------------------------------------------------------------------------------
+// upload-pack response caches
+// -------------------------------------------------------------------------------------------
+//
+// Git objects are content-addressed and immutable, and this store only ever
+// adds objects (never deletes or rewrites them), so an ls-refs / fetch
+// response is a pure function of three things: the request arguments, the
+// current refs, and the repo's object set. The object set itself is pinned by
+// its size: sets only grow, so two moments with the same size and the same
+// refs have the same objects. Keying cached responses on exactly those inputs
+// makes the cache sound with no invalidation bookkeeping — any state change
+// that could alter a response also alters the key, and an unrelated change
+// only costs a recompute.
+
+const RESPONSE_CACHE_LIMIT = 128;
+const RESPONSE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const responseCaches = new WeakMap<RepoRec, Map<string, Buffer>>();
+
+function refsSnapshot(repo: RepoRec): string {
+  return sortedRefs(repo)
+    .map(([name, sha]) => `${name} ${sha}`)
+    .join('\n');
+}
+
+function cachedResponse(repo: RepoRec, key: string, build: () => Buffer): Buffer {
+  let cache = responseCaches.get(repo);
+  if (!cache) {
+    cache = new Map();
+    responseCaches.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) {
+    // Refresh the LRU position.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+  const body = build();
+  if (body.length <= RESPONSE_CACHE_MAX_BYTES) {
+    cache.set(key, body);
+    while (cache.size > RESPONSE_CACHE_LIMIT) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+  }
+  return body;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -482,6 +534,26 @@ function parseFetchArgs(lines: string[]): FetchArgs {
   return args;
 }
 
+/**
+ * Cache key for a fetch response. The response depends on the arguments, on
+ * the refs (want-refs and deepen-not resolve through them), and on which of
+ * the named objects exist (planFetch treats missing objects specially, and
+ * shallow-boundary checks probe for parents). Object contents need no key
+ * material: a sha names its content. See the cache note above.
+ */
+function fetchCacheKey(repo: RepoRec, version: 'v0' | 'v2', args: FetchArgs): string {
+  const resolvedWantRefs = args.wantRefs.map((ref) => `${ref}=${repo.refs.get(ref) ?? ''}`);
+  const existence = [...args.wants, ...args.haves].map((sha) => (repo.objects.has(sha) ? '1' : '0')).join('');
+  return [
+    `fetch-${version}`,
+    String(repo.objects.size),
+    refsSnapshot(repo),
+    JSON.stringify(args),
+    resolvedWantRefs.join('\n'),
+    existence,
+  ].join('\0');
+}
+
 export async function gitUploadPack(ctx: HandlerContext, owner: string, repoName: string): Promise<void> {
   const repo = store.getRepo(owner, repoName);
   if (!repo) {
@@ -504,11 +576,16 @@ export async function gitUploadPack(ctx: HandlerContext, owner: string, repoName
     // Arguments are the lines after the delim packet.
     const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
     const argPackets = delimIndex >= 0 ? packets.slice(delimIndex + 1) : packets;
-    body = lsRefsResponse(repo, packetLines(argPackets));
+    const args = packetLines(argPackets);
+    // ls-refs output is a pure function of the refs, the HEAD target, the tag
+    // objects behind them (pinned by the object count), and the arguments.
+    const key = ['ls-refs', String(repo.objects.size), headTarget(repo), refsSnapshot(repo), args.join('\n')].join('\0');
+    body = cachedResponse(repo, key, () => lsRefsResponse(repo, args));
   } else if (commandLine === 'command=fetch' || isV2) {
     const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
     const argPackets = delimIndex >= 0 ? packets.slice(delimIndex + 1) : packets;
-    body = fetchV2Response(repo, parseFetchArgs(packetLines(argPackets)));
+    const args = parseFetchArgs(packetLines(argPackets));
+    body = cachedResponse(repo, fetchCacheKey(repo, 'v2', args), () => fetchV2Response(repo, args));
   } else {
     // Protocol v0: want/have sections separated by flush packets; lines carry it all.
     const args = parseFetchArgs(lines);
@@ -517,7 +594,7 @@ export async function gitUploadPack(ctx: HandlerContext, owner: string, repoName
       return;
     }
     args.done = true;
-    body = fetchV0Response(repo, args);
+    body = cachedResponse(repo, fetchCacheKey(repo, 'v0', args), () => fetchV0Response(repo, args));
   }
   ctx.res.writeHead(200, {
     'content-type': 'application/x-git-upload-pack-result',

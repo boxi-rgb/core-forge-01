@@ -216,7 +216,23 @@ export function ancestorsOf(repo: RepoRec, sha: string): Set<string> {
 
 export function isAncestor(repo: RepoRec, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return ancestorsOf(repo, descendant).has(ancestor);
+  // Early-exit DFS: walk the descendant's history and stop as soon as the
+  // ancestor is reached, instead of enumerating every ancestor first. The
+  // result is identical to `ancestorsOf(repo, descendant).has(ancestor)`:
+  // a sha only counts when it resolves to an existing commit object, exactly
+  // as in ancestorsOf, and every other commit is visited at most once.
+  const seen = new Set<string>();
+  const queue = [descendant];
+  while (queue.length > 0) {
+    const current = queue.pop()!;
+    if (seen.has(current)) continue;
+    const object = repo.objects.get(current);
+    if (!object || object.type !== 'commit') continue;
+    if (current === ancestor) return true;
+    seen.add(current);
+    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+  }
+  return false;
 }
 
 /**
