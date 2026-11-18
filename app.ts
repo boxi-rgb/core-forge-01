@@ -24,19 +24,53 @@ export interface HandlerContext {
 }
 
 /** The bearer token the suite presents: MAKEFUN_SHOP_TOKEN in a trial. */
+let expectedToken: string | null = null;
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
   if (!header.startsWith('Bearer ')) return false;
   const presented = header.slice('Bearer '.length);
   if (presented.length === 0) return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  return expected === '' || presented === expected;
+  // The trial fixes the token before the server starts; read it once, not per request.
+  if (expectedToken === null) expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return expectedToken === '' || presented === expectedToken;
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
+const EMPTY_BODY = Buffer.alloc(0);
+
+/** The shared empty body when the headers say the request carries none, else null. */
+function emptyBodyIfNone(req: IncomingMessage): Buffer | null {
+  const length = req.headers['content-length'];
+  if (req.headers['transfer-encoding'] === undefined && (length === undefined || length === '0')) {
+    return EMPTY_BODY;
+  }
+  return null;
+}
+
+/**
+ * Read the whole request body. Most requests here carry none (every GET, most
+ * REST reads): when the headers say so, answer at once instead of setting up
+ * stream machinery. Bodies that do exist are collected from data events —
+ * measurably cheaper per request than the async-iterator form — and a body
+ * that arrives as one chunk skips the concat copy.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  const empty = emptyBodyIfNone(req);
+  if (empty !== null) return Promise.resolve(empty);
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let settled = false;
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks));
+    });
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
 }
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
@@ -105,15 +139,32 @@ async function dispatch(ctx: HandlerContext): Promise<void> {
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        const body = await readBody(req);
-        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-        await dispatch({ req, res, url, body });
-      } catch {
-        if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
-        else res.end();
-      }
-    })();
+    const fail = (): void => {
+      if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+      else res.end();
+    };
+    // Start consuming the body first (if any), so the stream is flowing no
+    // matter what happens below — the same order the original code had.
+    const empty = emptyBodyIfNone(req);
+    const bodyPromise = empty === null ? readBody(req) : null;
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    } catch {
+      fail();
+      return;
+    }
+    // Requests without a body (every GET, most REST reads) skip the promise
+    // round-trips entirely and dispatch in this tick.
+    if (empty !== null) {
+      dispatch({ req, res, url, body: empty }).catch(fail);
+      return;
+    }
+    (bodyPromise as Promise<Buffer>).then(
+      (body) => {
+        dispatch({ req, res, url, body }).catch(fail);
+      },
+      () => fail(),
+    );
   });
 }
