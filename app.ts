@@ -1,49 +1,119 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The forge's HTTP surface: one server, four surfaces over one shared store.
+//   git smart HTTP  /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack
+//   REST v3         /api/v3/...
+//   GraphQL v4      /api/graphql
+//   MCP             /mcp
+// main.ts owns the entry <-> env lifecycle; this file is the server it builds.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { store } from './store.ts';
+import { sendError, sendJson } from './util.ts';
+import { gitInfoRefs, gitUploadPack } from './githttp.ts';
+import { gitReceivePack } from './receivepack.ts';
+import { handleRest } from './rest.ts';
+import { handlePulls } from './pulls.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+export interface HandlerContext {
+  req: IncomingMessage;
+  res: ServerResponse;
+  url: URL;
+  /** The whole request body (git packs are binary; everything else is JSON or empty). */
+  body: Buffer;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+/** The bearer token the suite presents: MAKEFUN_SHOP_TOKEN in a trial. */
+function authorized(req: IncomingMessage): boolean {
+  const header = req.headers.authorization ?? '';
+  if (!header.startsWith('Bearer ')) return false;
+  const presented = header.slice('Bearer '.length);
+  if (presented.length === 0) return false;
+  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return expected === '' || presented === expected;
+}
+
+async function readBody(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
+const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
+const PULLS_PATH = /^\/api\/v3\/repos\/[^/]+\/[^/]+\/pulls(\/|$)/;
+
+async function dispatch(ctx: HandlerContext): Promise<void> {
+  const { req, res, url } = ctx;
+  const path = url.pathname;
+  const method = req.method ?? 'GET';
+
+  // The env's boot check calls this twice: 200 {"ok":true}, no token needed.
+  if (method === 'GET' && path === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
   }
+
+  // Every other surface requires the trial's bearer token.
+  if (!authorized(req)) {
+    sendError(res, 401, 'Requires authentication');
+    return;
+  }
+
+  if (path === '/api/graphql') {
+    await handleGraphQL(ctx);
+    return;
+  }
+  if (path === '/mcp') {
+    await handleMcp(ctx);
+    return;
+  }
+
+  const git = GIT_PATH.exec(path);
+  if (git !== null) {
+    const owner = decodeURIComponent(git[1] as string);
+    const repo = decodeURIComponent(git[2] as string);
+    const tail = git[3] as string;
+    if (method === 'GET' && tail === 'info/refs') {
+      await gitInfoRefs(ctx, owner, repo);
+      return;
+    }
+    if (method === 'POST' && tail === 'git-upload-pack') {
+      await gitUploadPack(ctx, owner, repo);
+      return;
+    }
+    if (method === 'POST' && tail === 'git-receive-pack') {
+      await gitReceivePack(ctx, owner, repo);
+      return;
+    }
+    sendError(res, 404, 'Not Found');
+    return;
+  }
+
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    if (PULLS_PATH.test(path)) {
+      await handlePulls(ctx);
+      return;
+    }
+    await handleRest(ctx);
+    return;
+  }
+
+  // Any unknown route answers 404 JSON, never HTML.
+  sendError(res, 404, 'Not Found');
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    void (async () => {
+      try {
+        const body = await readBody(req);
+        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+        await dispatch({ req, res, url, body });
+      } catch {
+        if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+        else res.end();
+      }
+    })();
   });
 }
